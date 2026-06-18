@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from itertools import combinations
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
 
 import pandas as pd
 import plotly.express as px
@@ -9,12 +10,23 @@ import plotly.graph_objects as go
 import pycountry
 import streamlit as st
 
-from src.openalex_dashboard.data import explode_json_list_column
+from src.openalex_dashboard.data import safe_json_loads
 
 try:
     import networkx as nx
 except Exception:  # pragma: no cover
     nx = None
+
+# The NDPH cache can be large. These caps keep the collaborator tab stable while
+# still showing the highest-signal part of the collaboration structure.
+MAX_EXTERNAL_NETWORK_WORKS = 12000
+MAX_EXTERNAL_AUTHORS_PER_WORK = 12
+MAX_ROSTER_AUTHORS_PER_WORK = 8
+MAX_EXTERNAL_NODES = 35
+MAX_EXTERNAL_EDGES = 140
+MAX_INTERNAL_NETWORK_WORKS = 18000
+MAX_INTERNAL_EDGES = 80
+MAX_INTERNAL_PAIRS_TABLE = 50
 
 
 def format_int(value: Any) -> str:
@@ -22,6 +34,14 @@ def format_int(value: Any) -> str:
         return f"{int(value):,}"
     except Exception:
         return "0"
+
+
+def _plotly_chart(fig: go.Figure) -> None:
+    st.plotly_chart(fig, width="stretch")
+
+
+def _dataframe(df: pd.DataFrame, **kwargs) -> None:
+    st.dataframe(df, width="stretch", hide_index=True, **kwargs)
 
 
 def alpha2_to_country(code: Any):
@@ -52,27 +72,64 @@ def _external_authorships(authorships: pd.DataFrame) -> pd.DataFrame:
     return external
 
 
+def _unique_clean_values(values: Iterable[Any], limit: int | None = None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None or pd.isna(value):
+            continue
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
+def _list_from_json(value: Any, limit: int | None = None) -> list[str]:
+    return _unique_clean_values(safe_json_loads(value), limit=limit)
+
+
 def _country_summary(external: pd.DataFrame) -> pd.DataFrame:
-    country_df = explode_json_list_column(external, "country_codes_json", "country_code")
-    if country_df.empty:
-        return pd.DataFrame()
-    required_cols = {"country_code", "work_id"}
-    if not required_cols.issubset(country_df.columns):
+    if external.empty or "work_id" not in external.columns or "country_codes_json" not in external.columns:
         return pd.DataFrame()
 
-    if "author_id_short" not in country_df.columns:
-        country_df["author_id_short"] = None
+    rows_counter: Counter[str] = Counter()
+    work_sets: dict[str, set[str]] = defaultdict(set)
+    author_sets: dict[str, set[str]] = defaultdict(set)
 
-    country_summary = (
-        country_df.groupby("country_code", as_index=False)
-        .agg(
-            external_authorship_rows=("work_id", "size"),
-            collaborator_works=("work_id", "nunique"),
-            unique_external_authors=("author_id_short", "nunique"),
+    author_col = "author_id_short" if "author_id_short" in external.columns else None
+    cols = ["work_id", "country_codes_json"] + ([author_col] if author_col else [])
+    for row in external[cols].itertuples(index=False, name=None):
+        work_id = str(row[0]) if row[0] is not None else ""
+        countries = _list_from_json(row[1])
+        author_id = str(row[2]) if author_col and len(row) > 2 and row[2] is not None else ""
+        for code in countries:
+            code = str(code).upper().strip()
+            if not code:
+                continue
+            rows_counter[code] += 1
+            if work_id:
+                work_sets[code].add(work_id)
+            if author_id:
+                author_sets[code].add(author_id)
+
+    if not rows_counter:
+        return pd.DataFrame()
+
+    records = []
+    for code, row_count in rows_counter.items():
+        records.append(
+            {
+                "country_code": code,
+                "external_authorship_rows": row_count,
+                "collaborator_works": len(work_sets.get(code, set())),
+                "unique_external_authors": len(author_sets.get(code, set())),
+            }
         )
-        .sort_values("collaborator_works", ascending=False)
-    )
-    country_summary["country_code"] = country_summary["country_code"].astype(str).str.upper()
+    country_summary = pd.DataFrame(records).sort_values("collaborator_works", ascending=False)
     country_summary["country_name"] = country_summary["country_code"].apply(alpha2_to_name)
     country_summary["country_name"] = country_summary["country_name"].fillna(country_summary["country_code"])
     country_summary["iso_alpha"] = country_summary["country_code"].apply(alpha2_to_alpha3)
@@ -88,7 +145,7 @@ def _render_country_map(country_summary: pd.DataFrame) -> None:
     map_df = country_summary[country_summary["iso_alpha"].notna()].copy()
     if map_df.empty:
         st.info("No mappable country codes after conversion.")
-        st.dataframe(country_summary.head(25), use_container_width=True, hide_index=True)
+        _dataframe(country_summary.head(25))
         return
 
     c1, c2, c3 = st.columns(3)
@@ -143,10 +200,8 @@ def _render_country_map(country_summary: pd.DataFrame) -> None:
         plot_bgcolor="rgba(0,0,0,0)",
         coloraxis_colorbar=dict(title="Works", thickness=14, len=0.62, y=0.48, outlinewidth=0),
     )
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(
-        "Countries are counted from external co-author affiliation country codes in the currently filtered publication set."
-    )
+    _plotly_chart(fig)
+    st.caption("Countries are counted from external co-author affiliation country codes in the currently filtered publication set.")
 
     left, right = st.columns([1.15, 1])
     with left:
@@ -169,20 +224,12 @@ def _render_country_map(country_summary: pd.DataFrame) -> None:
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        _plotly_chart(fig_bar)
 
     with right:
-        show_cols = [
-            "country_name",
-            "country_code",
-            "collaborator_works",
-            "unique_external_authors",
-            "external_authorship_rows",
-        ]
-        st.dataframe(
+        show_cols = ["country_name", "country_code", "collaborator_works", "unique_external_authors", "external_authorship_rows"]
+        _dataframe(
             country_summary[show_cols].head(25),
-            use_container_width=True,
-            hide_index=True,
             column_config={
                 "country_name": "Country",
                 "country_code": "Code",
@@ -191,6 +238,41 @@ def _render_country_map(country_summary: pd.DataFrame) -> None:
                 "external_authorship_rows": "Authorship rows",
             },
         )
+
+
+def _top_external_institutions(external: pd.DataFrame, limit: int = 25) -> pd.DataFrame:
+    if external.empty or "work_id" not in external.columns or "institution_names_json" not in external.columns:
+        return pd.DataFrame()
+
+    row_counter: Counter[str] = Counter()
+    work_sets: dict[str, set[str]] = defaultdict(set)
+    author_sets: dict[str, set[str]] = defaultdict(set)
+    author_col = "author_id_short" if "author_id_short" in external.columns else None
+    cols = ["work_id", "institution_names_json"] + ([author_col] if author_col else [])
+    for row in external[cols].itertuples(index=False, name=None):
+        work_id = str(row[0]) if row[0] is not None else ""
+        institutions = _list_from_json(row[1], limit=20)
+        author_id = str(row[2]) if author_col and len(row) > 2 and row[2] is not None else ""
+        for inst in institutions:
+            row_counter[inst] += 1
+            if work_id:
+                work_sets[inst].add(work_id)
+            if author_id:
+                author_sets[inst].add(author_id)
+
+    if not row_counter:
+        return pd.DataFrame()
+
+    records = [
+        {
+            "institution_name_exploded": inst,
+            "external_authorship_rows": rows,
+            "collaborator_works": len(work_sets.get(inst, set())),
+            "unique_external_authors": len(author_sets.get(inst, set())),
+        }
+        for inst, rows in row_counter.items()
+    ]
+    return pd.DataFrame(records).sort_values("collaborator_works", ascending=False).head(limit)
 
 
 def _clean_node_name(value: Any) -> str | None:
@@ -232,129 +314,154 @@ def _node_totals(edges: pd.DataFrame) -> pd.DataFrame:
     return degree_weight.groupby("node", as_index=False).agg(total_shared_works=("shared_works", "sum"))
 
 
+def _limit_work_ids_for_network(authorships: pd.DataFrame, max_works: int) -> tuple[set[str], bool]:
+    if "work_id" not in authorships.columns:
+        return set(), False
+    work_order = authorships[["work_id"]].drop_duplicates().copy()
+    if "publication_year" in authorships.columns:
+        year_lookup = authorships[["work_id", "publication_year"]].drop_duplicates("work_id")
+        work_order = work_order.merge(year_lookup, on="work_id", how="left")
+        work_order["publication_year"] = pd.to_numeric(work_order["publication_year"], errors="coerce").fillna(-1)
+        work_order = work_order.sort_values(["publication_year", "work_id"], ascending=[False, True])
+    total = len(work_order)
+    if total > max_works:
+        work_order = work_order.head(max_works)
+    return set(work_order["work_id"].astype(str)), total > max_works
+
+
 def _build_collaboration_edges(
     authorships: pd.DataFrame,
-    max_external_nodes: int = 35,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    max_external_nodes: int = MAX_EXTERNAL_NODES,
+    max_edges: int = MAX_EXTERNAL_EDGES,
+) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
     required = {"work_id", "author_id_short", "author_name", "is_roster_person"}
     if authorships.empty or not required.issubset(authorships.columns):
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), False
 
-    roster = authorships[authorships["is_roster_person"].fillna(False)].copy()
-    external = authorships[~authorships["is_roster_person"].fillna(False)].copy()
+    work_ids, capped = _limit_work_ids_for_network(authorships, MAX_EXTERNAL_NETWORK_WORKS)
+    if not work_ids:
+        return pd.DataFrame(), pd.DataFrame(), capped
+    auth = authorships[authorships["work_id"].astype(str).isin(work_ids)].copy()
+
+    roster = auth[auth["is_roster_person"].fillna(False)].copy()
+    external = auth[~auth["is_roster_person"].fillna(False)].copy()
     if roster.empty or external.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), capped
 
-    roster = _add_node_id(roster, prefer_roster_name=True)
-    external = _add_node_id(external, prefer_roster_name=False)
+    roster = _add_node_id(roster, prefer_roster_name=True)[["work_id", "node_id"]].drop_duplicates()
+    external = _add_node_id(external, prefer_roster_name=False)[["work_id", "node_id"]].drop_duplicates()
     if roster.empty or external.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), capped
 
-    pair_rows = []
-    external_by_work = {work_id: group for work_id, group in external.groupby("work_id")}
-    for work_id, rgrp in roster.groupby("work_id"):
-        egrp = external_by_work.get(work_id)
-        if egrp is None or egrp.empty:
+    roster_by_work = roster.groupby("work_id")["node_id"].apply(lambda s: _unique_clean_values(s, limit=MAX_ROSTER_AUTHORS_PER_WORK))
+    external_by_work = external.groupby("work_id")["node_id"].apply(lambda s: _unique_clean_values(s, limit=MAX_EXTERNAL_AUTHORS_PER_WORK))
+
+    edge_counts: Counter[tuple[str, str]] = Counter()
+    external_totals: Counter[str] = Counter()
+    for work_id, sources in roster_by_work.items():
+        targets = external_by_work.get(work_id)
+        if not targets:
             continue
-        sources = sorted(set(rgrp["node_id"].dropna().astype(str)))
-        targets = sorted(set(egrp["node_id"].dropna().astype(str)))
         for source in sources:
             for target in targets:
                 if source and target and source != target:
-                    pair_rows.append({"source": source, "target": target, "work_id": work_id})
+                    edge_counts[(source, target)] += 1
+                    external_totals[target] += 1
 
-    if not pair_rows:
-        return pd.DataFrame(), pd.DataFrame()
+    if not edge_counts:
+        return pd.DataFrame(), pd.DataFrame(), capped
 
-    pairs = pd.DataFrame(pair_rows)
-    edges = (
-        pairs.groupby(["source", "target"], as_index=False)
-        .agg(shared_works=("work_id", "nunique"))
-        .sort_values("shared_works", ascending=False)
-    )
-    top_external = edges.groupby("target", as_index=False)["shared_works"].sum().nlargest(max_external_nodes, "shared_works")
-    edges = edges[edges["target"].isin(top_external["target"])].copy()
+    top_external = {node for node, _ in external_totals.most_common(max_external_nodes)}
+    records = [
+        {"source": source, "target": target, "shared_works": count}
+        for (source, target), count in edge_counts.items()
+        if target in top_external
+    ]
+    if not records:
+        return pd.DataFrame(), pd.DataFrame(), capped
+
+    edges = pd.DataFrame(records).sort_values("shared_works", ascending=False).head(max_edges)
     nodes = pd.DataFrame({"node": sorted(set(edges["source"]).union(edges["target"]))})
     roster_nodes = set(edges["source"])
     nodes["kind"] = nodes["node"].apply(lambda x: "Roster" if x in roster_nodes else "External collaborator")
     nodes = nodes.merge(_node_totals(edges), on="node", how="left")
     nodes["total_shared_works"] = nodes["total_shared_works"].fillna(0)
-    return nodes, edges
+    return nodes, edges, capped
 
 
-def _internal_roster_authorships(authorships: pd.DataFrame) -> pd.DataFrame:
+def _internal_roster_authorships(authorships: pd.DataFrame, max_works: int | None = None) -> tuple[pd.DataFrame, bool]:
     required = {"work_id", "is_roster_person"}
     if authorships.empty or not required.issubset(authorships.columns):
-        return pd.DataFrame()
-    roster = authorships[authorships["is_roster_person"].fillna(False)].copy()
+        return pd.DataFrame(), False
+    auth = authorships
+    capped = False
+    if max_works is not None:
+        work_ids, capped = _limit_work_ids_for_network(authorships, max_works)
+        auth = authorships[authorships["work_id"].astype(str).isin(work_ids)].copy()
+    roster = auth[auth["is_roster_person"].fillna(False)].copy()
     if roster.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), capped
     roster = _add_node_id(roster, prefer_roster_name=True)
     if roster.empty:
-        return pd.DataFrame()
-    return roster.drop_duplicates(["work_id", "node_id"])
+        return pd.DataFrame(), capped
+    return roster[["work_id", "node_id"]].drop_duplicates(), capped
 
 
 def _build_internal_collaboration_edges(
     authorships: pd.DataFrame,
-    max_edges: int = 60,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    roster = _internal_roster_authorships(authorships)
+    max_edges: int = MAX_INTERNAL_EDGES,
+) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+    roster, capped = _internal_roster_authorships(authorships, max_works=MAX_INTERNAL_NETWORK_WORKS)
     if roster.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), capped
 
-    pair_rows = []
-    for work_id, group in roster.groupby("work_id"):
-        staff_names = sorted(set(group["node_id"].dropna().astype(str)))
+    edge_counts: Counter[tuple[str, str]] = Counter()
+    for _, group in roster.groupby("work_id"):
+        staff_names = _unique_clean_values(group["node_id"], limit=MAX_ROSTER_AUTHORS_PER_WORK)
         if len(staff_names) < 2:
             continue
-        for source, target in combinations(staff_names, 2):
+        for source, target in combinations(sorted(staff_names), 2):
             if source and target and source != target:
-                pair_rows.append({"source": source, "target": target, "work_id": work_id})
+                edge_counts[(source, target)] += 1
 
-    if not pair_rows:
-        return pd.DataFrame(), pd.DataFrame()
+    if not edge_counts:
+        return pd.DataFrame(), pd.DataFrame(), capped
 
-    pairs = pd.DataFrame(pair_rows)
-    edges = (
-        pairs.groupby(["source", "target"], as_index=False)
-        .agg(shared_works=("work_id", "nunique"))
-        .sort_values(["shared_works", "source", "target"], ascending=[False, True, True])
-    )
+    edges = pd.DataFrame(
+        [
+            {"source": source, "target": target, "shared_works": count}
+            for (source, target), count in edge_counts.items()
+        ]
+    ).sort_values(["shared_works", "source", "target"], ascending=[False, True, True])
     graph_edges = edges.head(max_edges).copy()
     nodes = pd.DataFrame({"node": sorted(set(graph_edges["source"]).union(graph_edges["target"]))})
     nodes["kind"] = "Internal staff"
     nodes = nodes.merge(_node_totals(graph_edges), on="node", how="left")
     nodes["total_shared_works"] = nodes["total_shared_works"].fillna(0)
-    return nodes, edges
+    return nodes, edges, capped
 
 
 def _build_internal_collaborator_ranking(authorships: pd.DataFrame) -> pd.DataFrame:
-    roster = _internal_roster_authorships(authorships)
+    roster, _ = _internal_roster_authorships(authorships, max_works=MAX_INTERNAL_NETWORK_WORKS)
     if roster.empty:
         return pd.DataFrame()
-    collaborative_work_ids = set(roster.groupby("work_id")["node_id"].nunique().loc[lambda s: s >= 2].index)
-    if not collaborative_work_ids:
+
+    collaborators_by_person: dict[str, set[str]] = defaultdict(set)
+    for _, group in roster.groupby("work_id"):
+        staff_names = set(_unique_clean_values(group["node_id"], limit=MAX_ROSTER_AUTHORS_PER_WORK))
+        if len(staff_names) < 2:
+            continue
+        for person in staff_names:
+            collaborators_by_person[person].update(staff_names - {person})
+
+    if not collaborators_by_person:
         return pd.DataFrame()
-    collaborative_roster = roster[roster["work_id"].isin(collaborative_work_ids)].copy()
-    person_rows = []
-    for person, group in collaborative_roster.groupby("node_id"):
-        person_work_ids = set(group["work_id"])
-        collaborators: set[str] = set()
-        for work_id in person_work_ids:
-            staff_on_work = set(
-                collaborative_roster.loc[collaborative_roster["work_id"] == work_id, "node_id"].dropna().astype(str)
-            )
-            collaborators.update(staff_on_work - {person})
-        person_rows.append(
-            {
-                "internal_staff_member": person,
-                "unique_internal_collaborators": len(collaborators),
-            }
-        )
-    ranking = pd.DataFrame(person_rows)
-    if ranking.empty:
-        return ranking
+    ranking = pd.DataFrame(
+        [
+            {"internal_staff_member": person, "unique_internal_collaborators": len(collaborators)}
+            for person, collaborators in collaborators_by_person.items()
+        ]
+    )
     return ranking.sort_values(["unique_internal_collaborators", "internal_staff_member"], ascending=[False, True])
 
 
@@ -379,13 +486,7 @@ def _layout_network(nodes: pd.DataFrame, edges: pd.DataFrame, seed: int = 7) -> 
     }
 
 
-def _draw_network_figure(
-    nodes: pd.DataFrame,
-    edges: pd.DataFrame,
-    title: str,
-    height: int = 650,
-    seed: int = 7,
-) -> None:
+def _draw_network_figure(nodes: pd.DataFrame, edges: pd.DataFrame, title: str, height: int = 650, seed: int = 7) -> None:
     plot_edges = edges[edges["source"].isin(nodes["node"]) & edges["target"].isin(nodes["node"])].copy()
     if nodes.empty or plot_edges.empty:
         return
@@ -425,12 +526,7 @@ def _draw_network_figure(
                 customdata=shared,
                 marker=dict(size=sizes, line=dict(width=1.2, color="white"), opacity=0.88),
                 name=kind,
-                hovertemplate=(
-                    "%{text}<br>"
-                    f"Type: {kind}<br>"
-                    "Total shared works: %{customdata:,}"
-                    "<extra></extra>"
-                ),
+                hovertemplate=("%{text}<br>" f"Type: {kind}<br>" "Total shared works: %{customdata:,}" "<extra></extra>"),
             )
         )
 
@@ -444,43 +540,39 @@ def _draw_network_figure(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    _plotly_chart(fig)
 
 
 def _render_network(authorships: pd.DataFrame) -> None:
     st.subheader("External collaboration network")
-    nodes, edges = _build_collaboration_edges(authorships)
+    nodes, edges, capped = _build_collaboration_edges(authorships)
+    if capped:
+        st.caption(
+            f"Network graph is capped to the most recent {MAX_EXTERNAL_NETWORK_WORKS:,} works and the strongest edges so the NDPH view stays responsive. Tables/maps above still use the full filtered set."
+        )
     if nodes.empty or edges.empty:
         st.info("No external co-author network can be drawn for the current filters.")
         return
-    _draw_network_figure(
-        nodes=nodes,
-        edges=edges,
-        title="Roster staff connected to external co-authors",
-        height=650,
-        seed=7,
-    )
+    _draw_network_figure(nodes=nodes, edges=edges, title="Roster staff connected to external co-authors", height=650, seed=7)
 
 
 def _render_internal_network(authorships: pd.DataFrame) -> None:
     st.subheader("Internal staff collaboration network")
-    nodes, edges = _build_internal_collaboration_edges(authorships)
+    nodes, edges, capped = _build_internal_collaboration_edges(authorships)
+    if capped:
+        st.caption(
+            f"Internal network graph is capped to the most recent {MAX_INTERNAL_NETWORK_WORKS:,} works and strongest edges for stability."
+        )
     if nodes.empty or edges.empty:
         st.info("No internal staff-to-staff collaboration network can be drawn for the current filters.")
         return
 
-    graph_edges = edges.head(60).copy()
+    graph_edges = edges.head(MAX_INTERNAL_EDGES).copy()
     graph_nodes = pd.DataFrame({"node": sorted(set(graph_edges["source"]).union(graph_edges["target"]))})
     graph_nodes["kind"] = "Internal staff"
     graph_nodes = graph_nodes.merge(_node_totals(graph_edges), on="node", how="left")
     graph_nodes["total_shared_works"] = graph_nodes["total_shared_works"].fillna(0)
-    _draw_network_figure(
-        nodes=graph_nodes,
-        edges=graph_edges,
-        title="Internal roster staff connected by shared works",
-        height=620,
-        seed=11,
-    )
+    _draw_network_figure(nodes=graph_nodes, edges=graph_edges, title="Internal roster staff connected by shared works", height=620, seed=11)
 
     table_view = st.selectbox(
         "Internal collaboration ranking",
@@ -488,17 +580,11 @@ def _render_internal_network(authorships: pd.DataFrame) -> None:
         index=0,
     )
     if table_view == "Top internal collaborator pairs":
-        top_pairs = edges.head(30).rename(
-            columns={
-                "source": "staff_member_1",
-                "target": "staff_member_2",
-                "shared_works": "collaboration_count",
-            }
+        top_pairs = edges.head(MAX_INTERNAL_PAIRS_TABLE).rename(
+            columns={"source": "staff_member_1", "target": "staff_member_2", "shared_works": "collaboration_count"}
         )
-        st.dataframe(
+        _dataframe(
             top_pairs,
-            use_container_width=True,
-            hide_index=True,
             column_config={
                 "staff_member_1": "Internal staff member 1",
                 "staff_member_2": "Internal staff member 2",
@@ -510,10 +596,8 @@ def _render_internal_network(authorships: pd.DataFrame) -> None:
         if ranking.empty:
             st.info("No person-level internal collaboration ranking can be drawn for the current filters.")
             return
-        st.dataframe(
+        _dataframe(
             ranking.head(30),
-            use_container_width=True,
-            hide_index=True,
             column_config={
                 "internal_staff_member": "Internal staff member",
                 "unique_internal_collaborators": "Unique internal collaborators",
@@ -527,31 +611,21 @@ def render_collaborators_tab(bundle: Dict[str, Any], filtered: Dict[str, Any]) -
         st.info("No collaborator data match the current filters.")
         return
 
+    n_works = authorships["work_id"].nunique() if "work_id" in authorships.columns else 0
+    n_rows = len(authorships)
+    st.caption(f"Collaboration view based on {format_int(n_works)} filtered works and {format_int(n_rows)} authorship rows.")
+
     external = _external_authorships(authorships)
     country_summary = _country_summary(external)
     _render_country_map(country_summary)
 
     st.subheader("Top external institutions")
-    inst_df = explode_json_list_column(external, "institution_names_json", "institution_name_exploded")
-    if inst_df.empty:
+    top_insts = _top_external_institutions(external)
+    if top_insts.empty:
         st.info("No external institution data for the current filters.")
     else:
-        if "author_id_short" not in inst_df.columns:
-            inst_df["author_id_short"] = None
-        top_insts = (
-            inst_df.groupby("institution_name_exploded", as_index=False)
-            .agg(
-                external_authorship_rows=("work_id", "size"),
-                collaborator_works=("work_id", "nunique"),
-                unique_external_authors=("author_id_short", "nunique"),
-            )
-            .sort_values("collaborator_works", ascending=False)
-            .head(25)
-        )
-        st.dataframe(
+        _dataframe(
             top_insts,
-            use_container_width=True,
-            hide_index=True,
             column_config={
                 "institution_name_exploded": "Institution",
                 "external_authorship_rows": "Authorship rows",

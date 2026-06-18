@@ -4,8 +4,6 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
-
 from src.openalex_dashboard.config import (
     BASE_PAGE_TITLE,
     CACHE_DIR,
@@ -28,16 +26,9 @@ REQUIRED_FEATURE_TABLES = ["keywords_long", "funding_long"]
 
 
 def sync_browser_title(title: str) -> None:
-    safe_title = title.replace("\\", "\\\\").replace("'", "\\'")
-    components.html(
-        f"""
-        <script>
-        window.parent.document.title = '{safe_title}';
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
+    # Avoid using st.components.v1.html for dynamic browser-title updates.
+    # Streamlit deprecated that path; page branding is still shown in the app header.
+    return None
 
 
 def _display_path(path: Path) -> str:
@@ -166,20 +157,31 @@ def main() -> None:
     render_cache_status_panel(selected_dataset_key)
     filtered = apply_global_filters(bundle, filters)
 
+    tab_labels = ["Overview", "Domains & Sources", "Collaborators", "Publications Explorer", "Data Quality"]
     tab_overview, tab_domains, tab_collab, tab_explorer, tab_quality = st.tabs(
-        ["Overview", "Domains & Sources", "Collaborators", "Publications Explorer", "Data Quality"]
+        tab_labels,
+        default="Overview",
+        key=f"main_tabs_{selected_dataset_key}",
+        on_change="rerun",
     )
 
+    # Streamlit tabs used with the default behaviour compute and send every tab to the frontend.
+    # The OpenAlex NDPH cache is large, so we render only the open tab.
     with tab_overview:
-        render_overview_tab(bundle, filtered)
+        if getattr(tab_overview, "open", True):
+            render_overview_tab(bundle, filtered)
     with tab_domains:
-        render_domains_sources_tab(bundle, filtered)
+        if getattr(tab_domains, "open", False):
+            render_domains_sources_tab(bundle, filtered)
     with tab_collab:
-        render_collaborators_tab(bundle, filtered)
+        if getattr(tab_collab, "open", False):
+            render_collaborators_tab(bundle, filtered)
     with tab_explorer:
-        render_explorer_tab(bundle, filtered)
+        if getattr(tab_explorer, "open", False):
+            render_explorer_tab(bundle, filtered)
     with tab_quality:
-        render_data_quality_tab(bundle, filtered)
+        if getattr(tab_quality, "open", False):
+            render_data_quality_tab(bundle, filtered)
 
 
 if __name__ == "__main__":
