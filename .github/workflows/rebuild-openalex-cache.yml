@@ -1,0 +1,92 @@
+name: Rebuild OpenAlex cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Dataset to rebuild"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - demography
+          - ndph
+      fetch_raw_from_original_repo:
+        description: "Fetch raw CSVs from the original public repo if missing"
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    # Weekly Monday 04:30 UTC. Disable this block if manual-only is preferred.
+    - cron: "30 4 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild-cache:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch raw CSVs if requested/missing
+        if: ${{ github.event_name == 'schedule' || inputs.fetch_raw_from_original_repo == true }}
+        run: |
+          python scripts/fetch_raw_data.py
+
+      - name: Rebuild OpenAlex cache
+        env:
+          OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+        run: |
+          DATASET="${{ inputs.dataset }}"
+          if [ -z "$DATASET" ]; then DATASET="all"; fi
+          python scripts/build_openalex_cache.py --dataset "$DATASET"
+
+      - name: Remove stale CSV exports
+        run: |
+          find data/outputs -type f -name "*.csv" -delete || true
+
+      - name: Show generated data sizes
+        run: |
+          du -h data/raw || true
+          du -h data/cache || true
+          du -h data/outputs || true
+          python - <<'PY'
+          from pathlib import Path
+          limit = 95 * 1024 * 1024
+          too_big = []
+          for folder in [Path('data/raw'), Path('data/cache'), Path('data/outputs')]:
+              for path in folder.rglob('*'):
+                  if path.is_file() and path.suffix != '.csv' and path.stat().st_size > limit:
+                      too_big.append((str(path), path.stat().st_size))
+          if too_big:
+              for path, size in too_big:
+                  print(f'ERROR: {path} is {size/1024/1024:.1f} MB, too close to GitHub single-file limit. Split or move this file to external storage.')
+              raise SystemExit(1)
+          PY
+
+      - name: Commit generated cache and outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/raw data/cache data/outputs
+          if git diff --cached --quiet; then
+            echo "No generated data changes to commit."
+          else
+            git commit -m "Rebuild OpenAlex dashboard cache"
+            git push
+          fi
