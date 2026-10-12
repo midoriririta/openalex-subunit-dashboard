@@ -20,7 +20,7 @@ try:
 except ImportError:  # pragma: no cover
     class _DummyStreamlit:
         @staticmethod
-        def cache_data(*args, **kwargs):
+        def cache_resource(*args, **kwargs):
             def decorator(func):
                 return func
             return decorator
@@ -120,8 +120,11 @@ def _fallback_roster_works(bundle: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(show_spinner=True)
+@st.cache_resource(show_spinner=True)
 def load_bundle(dataset_key: str = DEFAULT_DATASET_KEY, cache_dir: Path | str = CACHE_DIR) -> Dict[str, Any]:
+    # Share the read-only cache across reruns/sessions. cache_data serializes and
+    # copies this large bundle on every interaction, exhausting cloud memory.
+    # Filters and views must copy tables before modifying them.
     status = cache_status(dataset_key=dataset_key, cache_dir=cache_dir)
     dataset = status["dataset"]
     required = status["required"]
