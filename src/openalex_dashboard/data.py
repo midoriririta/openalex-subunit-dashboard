@@ -185,6 +185,11 @@ def load_bundle(dataset_key: str = DEFAULT_DATASET_KEY, cache_dir: Path | str = 
     bundle["dataset"] = dataset
     bundle["dataset_key"] = dataset["key"]
     bundle["cache_paths"] = status
+    # These choices depend on the loaded dataset, not the current UI filters.
+    # Build the small lookup once with the resource instead of on every rerun.
+    from src.openalex_dashboard.filters import _topic_option_rows
+
+    bundle["topic_options"] = _topic_option_rows(bundle)
     return bundle
 
 

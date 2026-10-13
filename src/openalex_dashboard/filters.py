@@ -130,7 +130,9 @@ def render_sidebar_filters(bundle: Dict[str, Any]) -> Dict[str, Any]:
     if "source_type" in works.columns:
         source_type_options = sorted(works["source_type"].dropna().astype(str).unique().tolist())
 
-    topic_options_df = _topic_option_rows(bundle)
+    topic_options_df = bundle.get("topic_options")
+    if topic_options_df is None:
+        topic_options_df = _topic_option_rows(bundle)
     topic_option_labels = topic_options_df["option"].tolist() if not topic_options_df.empty else []
     topic_option_records = topic_options_df.set_index("option").to_dict("index") if not topic_options_df.empty else {}
 

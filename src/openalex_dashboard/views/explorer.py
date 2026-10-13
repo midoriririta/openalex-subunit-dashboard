@@ -158,6 +158,15 @@ def render_explorer_tab(bundle: Dict[str, Any], filtered: Dict[str, Any]) -> Non
         if col in works.columns
     ]
 
+    # The fragment retains only the displayed columns, not the full data bundle.
+    # Local table controls can then rerun without rebuilding global filters or
+    # publication summaries. Sidebar changes still trigger a fresh full render.
+    _render_explorer_table(works[columns])
+
+
+@st.fragment
+def _render_explorer_table(works: pd.DataFrame) -> None:
+    columns = works.columns.tolist()
     sort_options = [col for col in ["publication_year", "cited_by_count", "source_name", "title"] if col in works.columns]
     sort_col = st.selectbox("Sort table by", options=sort_options, index=1 if "cited_by_count" in sort_options else 0)
     ascending = st.checkbox("Sort ascending", value=False)
