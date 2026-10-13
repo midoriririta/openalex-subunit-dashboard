@@ -49,7 +49,7 @@ def _render_open_access_panel(works: pd.DataFrame) -> None:
     )
     fig.update_layout(
         showlegend=False,
-        height=280,
+        height=220,
         margin=dict(l=0, r=0, t=0, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         annotations=[dict(
@@ -60,7 +60,9 @@ def _render_open_access_panel(works: pd.DataFrame) -> None:
     )
 
     st.markdown("##### Open access status")
-    chart_col, legend_col = st.columns([1.15, 2], gap="small", vertical_alignment="center")
+    with st.container(horizontal=True, horizontal_alignment="center", vertical_alignment="center", gap="small"):
+        chart_col = st.container(width=180)
+        legend_col = st.container(width=380)
     with chart_col:
         st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
     with legend_col:
