@@ -1,10 +1,93 @@
 from __future__ import annotations
 
+from html import escape
 from typing import Any, Dict
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+
+
+OA_STATUS_STYLES = {
+    "green": ("Free copy in a repository", "Green", "#287F81"),
+    "gold": ("Fully open-access journal", "Gold", "#284F70"),
+    "diamond": ("Open journal, no publishing fee", "Diamond", "#557A64"),
+    "hybrid": ("Open article in a subscription journal", "Hybrid", "#7C92AF"),
+    "bronze": ("Free on publisher website", "Bronze", "#B18B50"),
+    "closed": ("No free copy recorded", "Closed", "#A4ABB2"),
+    "unknown": ("Status not recorded", "Unknown", "#D1D6DA"),
+}
+
+
+def _render_open_access_panel(works: pd.DataFrame) -> None:
+    oa = works[["work_id", "oa_status"]].copy()
+    status = oa["oa_status"].astype("string").str.strip().str.lower()
+    oa["oa_status"] = status.where(status.isin(OA_STATUS_STYLES), "unknown")
+    counts = oa.groupby("oa_status")["work_id"].nunique()
+    statuses = [status for status in OA_STATUS_STYLES if counts.get(status, 0) > 0]
+    total = int(counts.sum())
+    if not total:
+        return
+
+    labels = [OA_STATUS_STYLES[status][0] for status in statuses]
+    terms = [OA_STATUS_STYLES[status][1] for status in statuses]
+    colors = [OA_STATUS_STYLES[status][2] for status in statuses]
+    values = [int(counts[status]) for status in statuses]
+    fig = go.Figure(
+        go.Pie(
+            labels=labels,
+            values=values,
+            customdata=terms,
+            marker=dict(colors=colors, line=dict(width=0)),
+            hole=0.7,
+            sort=False,
+            direction="clockwise",
+            textinfo="none",
+            hovertemplate="%{label} (%{customdata})<br>%{value:,} publications · %{percent:.1%}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        showlegend=False,
+        height=280,
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        annotations=[dict(
+            x=0.5, y=0.5, showarrow=False,
+            text=f"<b>{total:,}</b><br><span style='font-size:11px'>publications</span>",
+            font=dict(size=22),
+        )],
+    )
+
+    st.markdown("##### Open access status")
+    chart_col, legend_col = st.columns([1.15, 2], gap="small", vertical_alignment="center")
+    with chart_col:
+        st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+    with legend_col:
+        rows = []
+        for status, count in zip(statuses, values):
+            label, term, color = OA_STATUS_STYLES[status]
+            rows.append(
+                f'<div class="oa-status-row" role="listitem">'
+                f'<span class="oa-status-swatch" style="background:{color}" aria-hidden="true"></span>'
+                f'<span class="oa-status-label">{escape(label)}<small>{escape(term)}</small></span>'
+                f'<span class="oa-status-value">{count / total:.1%}<small>{count:,} publications</small></span>'
+                '</div>'
+            )
+        st.html(
+            """<style>
+            .oa-status-legend { font-size:13px; line-height:1.4; }
+            .oa-status-row { display:grid; grid-template-columns:9px minmax(0,1fr) 106px;
+                gap:9px; align-items:start; padding:10px 0; border-bottom:1px solid rgba(128,140,153,.25); }
+            .oa-status-row:last-child { border-bottom:0; }
+            .oa-status-swatch { width:9px; height:9px; border-radius:2px; margin-top:5px; }
+            .oa-status-label { font-weight:500; overflow-wrap:anywhere; }
+            .oa-status-value { font-weight:500; text-align:right; font-variant-numeric:tabular-nums; }
+            .oa-status-legend small { display:block; opacity:.74; font-size:11px; font-weight:400;
+                margin-top:3px; }
+            </style><div class="oa-status-legend" role="list" aria-label="Open access categories">"""
+            + "".join(rows) + "</div>"
+        )
 
 
 def _safe_metric(label: str, value: Any) -> None:
@@ -49,11 +132,7 @@ def render_overview_tab(bundle: Dict[str, Any], filtered: Dict[str, Any]) -> Non
     col_a, col_b = st.columns(2)
     with col_a:
         if "oa_status" in works.columns:
-            oa = works.fillna({"oa_status": "unknown"}).groupby("oa_status", as_index=False).agg(works_count=("work_id", "nunique"))
-            if not oa.empty:
-                fig = px.pie(oa, names="oa_status", values="works_count", hole=0.45)
-                fig.update_layout(title="Open access status", margin=dict(l=0, r=0, t=40, b=0))
-                st.plotly_chart(fig, use_container_width=True)
+            _render_open_access_panel(works)
     with col_b:
         if "work_type" in works.columns:
             wt = works.fillna({"work_type": "unknown"}).groupby("work_type", as_index=False).agg(works_count=("work_id", "nunique"))
